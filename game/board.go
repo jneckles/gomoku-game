@@ -83,3 +83,10 @@ func (b *Board) Render() string {
 	}
 	return sb.String()
 }
+
+// Remove func added for alpha beta pruning step, removes a move from the board.
+func (b *Board) Remove(r, c int) {
+	if b.InBounds(r, c){
+		b.Cells[r][c] = Empty
+	}
+}
