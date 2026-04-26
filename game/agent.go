@@ -11,7 +11,10 @@ const (
 // higher depth makes it stronger but slower
 func (b *Board) BestMove(aiPlayer Player, depth int) Move {
 	moves := b.GenerateMoves()
+	return b.bestMoveFromList(aiPlayer, depth, moves)
+}
 
+func (b *Board) bestMoveFromList(aiPlayer Player, depth int, moves []Move) Move {
 	// just a safety incase no moves exist.
 	if len(moves) == 0 {
 		return Move{Row: -1, Col: -1}

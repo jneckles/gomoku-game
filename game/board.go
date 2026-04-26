@@ -21,6 +21,15 @@ func FullBoard(size int) *Board {
 	return &Board{Size: size, Cells: cells}
 }
 
+// Clone returns a deep copy of the board so callers can simulate moves safely.
+func (b *Board) Clone() *Board {
+	clone := FullBoard(b.Size)
+	for r := 0; r < b.Size; r++ {
+		copy(clone.Cells[r], b.Cells[r])
+	}
+	return clone
+}
+
 // this checks if a coordinate that is put is actually in the board.
 func (b *Board) InBounds(r, c int) bool {
 	return r >= 0 && r < b.Size && c >= 0 && c < b.Size
@@ -86,7 +95,7 @@ func (b *Board) Render() string {
 
 // Remove func added for alpha beta pruning step, removes a move from the board.
 func (b *Board) Remove(r, c int) {
-	if b.InBounds(r, c){
+	if b.InBounds(r, c) {
 		b.Cells[r][c] = Empty
 	}
 }
