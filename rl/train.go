@@ -10,7 +10,7 @@ import (
 
 const (
 	replayCapacity = 100_000
-	replayBatch    = 256
+	replayBatch    = 16
 )
 
 type experience struct {
