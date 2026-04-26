@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	replayCapacity = 16384
-	replayBatch    = 24
+	replayCapacity = 100_000
+	replayBatch    = 256
 )
 
 type experience struct {
@@ -41,12 +41,12 @@ func DefaultTrainerConfig() TrainerConfig {
 	return TrainerConfig{
 		BoardSize:       15,
 		Episodes:        2000,
-		LearningRate:    0.05,
-		Discount:        0.94,
+		LearningRate:    0.001,
+		Discount:        0.95,
 		EpsilonStart:    0.24,
 		EpsilonEnd:      0.02,
-		OpponentDepth:   1,
-		TeacherDepth:    2,
+		OpponentDepth:   3,
+		TeacherDepth:    3,
 		TeacherBlend:    0.18,
 		MixedCurriculum: true,
 		Seed:            time.Now().UnixNano(),
@@ -79,6 +79,12 @@ func Train(agent *Agent, cfg TrainerConfig) Stats {
 	return stats
 }
 
+// rlTrajectoryStep records one RL move during a training episode.
+type rlTrajectoryStep struct {
+	features   []float64
+	shapingRwd float64
+}
+
 func playTrainingEpisode(agent *Agent, cfg TrainerConfig, epsilon float64, rng *rand.Rand, replay *replayBuffer) int {
 	board := game.FullBoard(cfg.BoardSize)
 	rlPlayer := game.P1
@@ -90,18 +96,19 @@ func playTrainingEpisode(agent *Agent, cfg TrainerConfig, epsilon float64, rng *
 		opponent = game.P1
 	}
 
+	var trajectory []rlTrajectoryStep
+
 	for !board.Full() {
 		if current == rlPlayer {
-			prevEval := normalizeEval(board.Evaluate(rlPlayer))
-			prevSelfThreats := countWinningMoves(board, rlPlayer)
 			prevOppThreats := countWinningMoves(board, opponent)
-			prevSelfLine := board.MaxLine(rlPlayer)
-			prevOppLine := board.MaxLine(opponent)
+
 			move, features, _ := agent.selectMove(board, rlPlayer, epsilon, rng)
 			if move.Row == -1 {
+				applyMCReturns(agent, replay, trajectory, 0.0, cfg.LearningRate, cfg.Discount, rng)
 				return 0
 			}
 
+			// Inline teacher imitation — signals applied immediately, not via MC.
 			teacherDepth := cfg.TeacherDepth
 			if teacherDepth <= 0 {
 				teacherDepth = max(1, cfg.OpponentDepth)
@@ -109,72 +116,66 @@ func playTrainingEpisode(agent *Agent, cfg TrainerConfig, epsilon float64, rng *
 			if shouldConsultTeacher(board, rlPlayer) {
 				teacherMove := board.BestMove(rlPlayer, teacherDepth)
 				if teacherMove.Row != -1 && (teacherMove.Row != move.Row || teacherMove.Col != move.Col) {
-					teacherFeatures := extractFeatures(board, rlPlayer, teacherMove)
-					teacherTarget := 0.85
-					penaltyTarget := imitationNegativeTarget(board, rlPlayer, move)
 					blend := clamp(cfg.TeacherBlend, 0, 1)
-					applyLearning(agent, replay, teacherFeatures, teacherTarget, cfg.LearningRate*blend, rng)
+					teacherFeatures := extractFeatures(board, rlPlayer, teacherMove)
+					penaltyTarget := imitationNegativeTarget(board, rlPlayer, move)
+					applyLearning(agent, replay, teacherFeatures, 0.85, cfg.LearningRate*blend, rng)
 					applyLearning(agent, replay, features, penaltyTarget, cfg.LearningRate*blend, rng)
 				}
 			}
 
 			if err := board.Place(move.Row, move.Col, rlPlayer); err != nil {
+				applyMCReturns(agent, replay, trajectory, -1.0, cfg.LearningRate, cfg.Discount, rng)
 				return -1
 			}
 
+			// Tactical shaping (no eval-based signal to avoid leaking AB evaluator).
+			postSelfThreats := countWinningMoves(board, rlPlayer)
+			postOppThreats := countWinningMoves(board, opponent)
+			shaping := 0.0
+			if postSelfThreats > 0 {
+				shaping += 0.05 * float64(postSelfThreats)
+			}
+			if prevOppThreats > 0 && postOppThreats == 0 {
+				shaping += 0.15
+			}
+			shaping -= 0.05 * float64(postOppThreats)
+			shaping = clamp(shaping, -0.2, 0.2)
+
+			trajectory = append(trajectory, rlTrajectoryStep{features: features, shapingRwd: shaping})
+
 			if board.HasFive(move.Row, move.Col, rlPlayer) {
-				target := 1.0
-				applyLearning(agent, replay, features, target, cfg.LearningRate, rng)
+				applyMCReturns(agent, replay, trajectory, 1.0, cfg.LearningRate, cfg.Discount, rng)
 				return 1
 			}
 			if board.Full() {
-				applyLearning(agent, replay, features, 0, cfg.LearningRate, rng)
+				applyMCReturns(agent, replay, trajectory, 0.0, cfg.LearningRate, cfg.Discount, rng)
 				return 0
 			}
 
 			opponentMove := chooseOpponentMove(board, opponent, opponentDepthForEpisode(cfg, rng), rng, episodeOpponentStyle(rng))
 			if opponentMove.Row == -1 {
-				applyLearning(agent, replay, features, 0, cfg.LearningRate, rng)
+				applyMCReturns(agent, replay, trajectory, 0.0, cfg.LearningRate, cfg.Discount, rng)
 				return 0
 			}
 			if err := board.Place(opponentMove.Row, opponentMove.Col, opponent); err != nil {
-				applyLearning(agent, replay, features, -1, cfg.LearningRate, rng)
+				applyMCReturns(agent, replay, trajectory, -1.0, cfg.LearningRate, cfg.Discount, rng)
 				return -1
 			}
 			if board.HasFive(opponentMove.Row, opponentMove.Col, opponent) {
-				applyLearning(agent, replay, features, -1, cfg.LearningRate, rng)
+				applyMCReturns(agent, replay, trajectory, -1.0, cfg.LearningRate, cfg.Discount, rng)
 				return -1
 			}
 			if board.Full() {
-				applyLearning(agent, replay, features, 0, cfg.LearningRate, rng)
+				applyMCReturns(agent, replay, trajectory, 0.0, cfg.LearningRate, cfg.Discount, rng)
 				return 0
 			}
 
-			nextQ := agent.maxQ(board, rlPlayer)
-			postEval := normalizeEval(board.Evaluate(rlPlayer))
-			postSelfThreats := countWinningMoves(board, rlPlayer)
-			postOppThreats := countWinningMoves(board, opponent)
-			postSelfLine := board.MaxLine(rlPlayer)
-			postOppLine := board.MaxLine(opponent)
-
-			reward := clamp(postEval-prevEval, -0.2, 0.2)
-			reward += clamp(0.12*float64(postSelfThreats-prevSelfThreats), -0.18, 0.18)
-			reward -= clamp(0.16*float64(postOppThreats-prevOppThreats), -0.22, 0.22)
-			reward += clamp(0.05*float64(postSelfLine-prevSelfLine), -0.10, 0.10)
-			reward -= clamp(0.06*float64(postOppLine-prevOppLine), -0.10, 0.10)
-			if prevOppThreats > 0 && postOppThreats == 0 {
-				reward += 0.15
-			}
-			if postSelfThreats > prevSelfThreats {
-				reward += 0.08
-			}
-			reward = clamp(reward, -0.45, 0.45)
-			target := reward + cfg.Discount*nextQ
-			applyLearning(agent, replay, features, target, cfg.LearningRate, rng)
 			current = rlPlayer
 			continue
 		}
 
+		// Opponent's initial move (only reached when rlPlayer == P2).
 		move := chooseOpponentMove(board, current, opponentDepthForEpisode(cfg, rng), rng, episodeOpponentStyle(rng))
 		if move.Row == -1 {
 			return 0
@@ -184,6 +185,7 @@ func playTrainingEpisode(agent *Agent, cfg TrainerConfig, epsilon float64, rng *
 		}
 		if board.HasFive(move.Row, move.Col, current) {
 			if current == opponent {
+				applyMCReturns(agent, replay, trajectory, -1.0, cfg.LearningRate, cfg.Discount, rng)
 				return -1
 			}
 			return 1
@@ -191,7 +193,20 @@ func playTrainingEpisode(agent *Agent, cfg TrainerConfig, epsilon float64, rng *
 		current = rlPlayer
 	}
 
+	applyMCReturns(agent, replay, trajectory, 0.0, cfg.LearningRate, cfg.Discount, rng)
 	return 0
+}
+
+// applyMCReturns propagates the terminal reward backward through the trajectory.
+// Each step's target = shaping_reward + discount * future_return.
+func applyMCReturns(agent *Agent, replay *replayBuffer, trajectory []rlTrajectoryStep, terminalReward float64, lr, discount float64, rng *rand.Rand) {
+	G := terminalReward
+	for i := len(trajectory) - 1; i >= 0; i-- {
+		step := trajectory[i]
+		G = step.shapingRwd + discount*G
+		target := clamp(G, -1.5, 1.5)
+		applyLearning(agent, replay, step.features, target, lr, rng)
+	}
 }
 
 func Evaluate(agent *Agent, cfg TrainerConfig, episodes int) Stats {
@@ -240,7 +255,7 @@ func applyLearning(agent *Agent, replay *replayBuffer, features []float64, targe
 	replay.add(features, target)
 
 	for _, exp := range replay.sample(rng, replayBatch) {
-		agent.trainTowards(exp.features, exp.target, alpha*0.6)
+		agent.trainTowards(exp.features, exp.target, alpha*0.5)
 	}
 }
 
@@ -254,9 +269,9 @@ func opponentDepthForEpisode(cfg TrainerConfig, rng *rand.Rand) int {
 
 	roll := rng.Float64()
 	switch {
-	case roll < 0.30:
+	case roll < 0.20:
 		return 1
-	case roll < 0.65:
+	case roll < 0.50:
 		return max(1, cfg.OpponentDepth-1)
 	default:
 		return cfg.OpponentDepth

@@ -23,6 +23,7 @@ import (
 const (
 	boardSize        = 15
 	searchDepth      = 3
+	rlSearchDepth    = 2 // depth for RL alpha-beta at inference (2 = see opponent reply)
 	defaultModelPath = "models/rl_player.json"
 	aiAlphaBeta      = "Alpha-Beta"
 	aiRL             = "Reinforcement Learning"
@@ -544,7 +545,7 @@ func chooseBenchmarkMove(board *game.Board, player game.Player, agent *rl.Agent,
 	if agent == nil {
 		return board.BestMove(player, searchDepth)
 	}
-	return agent.BestMove(board, player)
+	return agent.BestMoveWithSearch(board, player, rlSearchDepth)
 }
 
 func chooseBenchmarkOpeningMove(board *game.Board, player game.Player, rng *rand.Rand) game.Move {
@@ -917,13 +918,13 @@ func (g *gomokuApp) chooseMoveFor(player game.Player) game.Move {
 			return g.board.BestMove(player, searchDepth)
 		}
 		if g.rlAgent != nil {
-			return g.rlAgent.BestMove(g.board, player)
+			return g.rlAgent.BestMoveWithSearch(g.board, player, rlSearchDepth)
 		}
 		return g.board.BestMove(player, searchDepth)
 	}
 
 	if g.selectedAI == aiRL && g.rlAgent != nil {
-		return g.rlAgent.BestMove(g.board, player)
+		return g.rlAgent.BestMoveWithSearch(g.board, player, rlSearchDepth)
 	}
 	return g.board.BestMove(player, searchDepth)
 }

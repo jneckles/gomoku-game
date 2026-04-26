@@ -28,7 +28,7 @@ func DefaultHardeningConfig() HardeningConfig {
 		Games:           20,
 		TeacherDepth:    3,
 		NegativeSamples: 4,
-		LearningRate:    0.025,
+		LearningRate:    0.001,
 		Seed:            time.Now().UnixNano(),
 	}
 }

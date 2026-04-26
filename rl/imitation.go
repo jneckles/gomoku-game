@@ -35,7 +35,7 @@ func DefaultImitationConfig() ImitationConfig {
 		Games:           200,
 		TeacherDepth:    3,
 		NegativeSamples: 4,
-		LearningRate:    0.03,
+		LearningRate:    0.001,
 		Seed:            time.Now().UnixNano(),
 	}
 }

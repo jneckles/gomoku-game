@@ -30,7 +30,7 @@ func DefaultSparringConfig() SparringConfig {
 		Games:           12,
 		TeacherDepth:    3,
 		NegativeSamples: 4,
-		LearningRate:    0.025,
+		LearningRate:    0.001,
 		Seed:            time.Now().UnixNano(),
 	}
 }

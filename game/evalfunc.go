@@ -91,7 +91,7 @@ func (b *Board) Evaluate(aiPlayer Player) int {
 		}
 		if len(line) >= 5 {
 			score += evalLine(line, aiPlayer)
-			score += evalLine(line, opponent)
+			score -= evalLine(line, opponent)
 		}
 	}
 	return score

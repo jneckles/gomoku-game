@@ -19,6 +19,14 @@ const (
 	featureCount         = tacticalFeatureCount + boardFeatureSize*boardFeaturePlanes
 	defaultHiddenSize    = 128
 	modelVersion         = 4
+
+	// Adam optimizer hyperparameters
+	adamBeta1 = 0.9
+	adamBeta2 = 0.999
+	adamEps   = 1e-8
+
+	// RL inference: alpha-beta depth using RL as the leaf evaluator
+	rlSearchDepth = 2
 )
 
 type Agent struct {
@@ -32,6 +40,17 @@ type Agent struct {
 
 	// Legacy field kept for backward-compatible loading of older linear models.
 	Weights []float64 `json:"weights,omitempty"`
+
+	// Adam optimizer state — unexported so JSON ignores them, initialized lazily.
+	adamM1W1 []float64
+	adamM2W1 []float64
+	adamM1W2 []float64
+	adamM2W2 []float64
+	adamM1B1 []float64
+	adamM2B1 []float64
+	adamM1B2 float64
+	adamM2B2 float64
+	adamT    int
 }
 
 type Stats struct {
@@ -149,9 +168,136 @@ func (a *Agent) Save(path string) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
+// BestMove picks the best move using flat RL scoring (fast, used in training loops).
 func (a *Agent) BestMove(board *game.Board, player game.Player) game.Move {
 	move, _, _ := a.selectMove(board, player, 0, rand.New(rand.NewSource(time.Now().UnixNano())))
 	return move
+}
+
+// BestMoveWithSearch runs alpha-beta at the given depth using the RL network as
+// the leaf evaluator. Use this for benchmarking and GUI play.
+func (a *Agent) BestMoveWithSearch(board *game.Board, player game.Player, depth int) game.Move {
+	moves := board.GenerateMoves()
+	if len(moves) == 0 {
+		return game.Move{Row: -1, Col: -1}
+	}
+
+	bestMove := moves[0]
+	bestScore := math.Inf(-1)
+	alpha := math.Inf(-1)
+	beta := math.Inf(1)
+
+	for _, move := range moves {
+		if err := board.Place(move.Row, move.Col, player); err != nil {
+			continue
+		}
+
+		var score float64
+		if board.HasFive(move.Row, move.Col, player) {
+			score = 1.0
+		} else if depth <= 1 {
+			score = a.leafValue(board, player)
+		} else {
+			score = a.rlAlphaBeta(board, depth-1, alpha, beta, false, player, move)
+		}
+
+		board.Remove(move.Row, move.Col)
+
+		if score > bestScore {
+			bestScore = score
+			bestMove = move
+			if bestScore > alpha {
+				alpha = bestScore
+			}
+		}
+	}
+
+	return bestMove
+}
+
+// rlAlphaBeta is minimax with alpha-beta pruning, using the RL network at leaves.
+func (a *Agent) rlAlphaBeta(board *game.Board, depth int, alpha, beta float64, maximizing bool, aiPlayer game.Player, lastMove game.Move) float64 {
+	opponent := aiPlayer.Other()
+
+	lastPlayer := opponent
+	if !maximizing {
+		lastPlayer = aiPlayer
+	}
+
+	if lastMove.Row != -1 && lastMove.Col != -1 {
+		if board.HasFive(lastMove.Row, lastMove.Col, lastPlayer) {
+			if lastPlayer == aiPlayer {
+				return 1.0
+			}
+			return -1.0
+		}
+	}
+
+	if depth == 0 || board.Full() {
+		return a.leafValue(board, aiPlayer)
+	}
+
+	moves := board.GenerateMoves()
+	if len(moves) == 0 {
+		return a.leafValue(board, aiPlayer)
+	}
+
+	if maximizing {
+		value := math.Inf(-1)
+		for _, move := range moves {
+			if err := board.Place(move.Row, move.Col, aiPlayer); err != nil {
+				continue
+			}
+			score := a.rlAlphaBeta(board, depth-1, alpha, beta, false, aiPlayer, move)
+			board.Remove(move.Row, move.Col)
+			if score > value {
+				value = score
+			}
+			if value > alpha {
+				alpha = value
+			}
+			if alpha >= beta {
+				break
+			}
+		}
+		return value
+	}
+
+	value := math.Inf(1)
+	for _, move := range moves {
+		if err := board.Place(move.Row, move.Col, opponent); err != nil {
+			continue
+		}
+		score := a.rlAlphaBeta(board, depth-1, alpha, beta, true, aiPlayer, move)
+		board.Remove(move.Row, move.Col)
+		if score < value {
+			value = score
+		}
+		if value < beta {
+			beta = value
+		}
+		if beta <= alpha {
+			break
+		}
+	}
+	return value
+}
+
+// leafValue estimates position value from aiPlayer's perspective for AB leaf nodes.
+// Uses a fast hybrid: RL network for immediate tactical moves, AB heuristic otherwise.
+func (a *Agent) leafValue(board *game.Board, aiPlayer game.Player) float64 {
+	opponent := aiPlayer.Other()
+
+	// RL scores the immediate win or forced block move (1 forward pass).
+	if wins := board.WinningMoves(aiPlayer); len(wins) > 0 {
+		return a.predict(extractFeatures(board, aiPlayer, wins[0]))
+	}
+	if threats := board.WinningMoves(opponent); len(threats) > 0 {
+		return a.predict(extractFeatures(board, aiPlayer, threats[0]))
+	}
+
+	// For quiet positions, the normalized AB heuristic is used.
+	return normalizeEval(board.Evaluate(aiPlayer))
 }
 
 func (a *Agent) selectMove(board *game.Board, player game.Player, epsilon float64, rng *rand.Rand) (game.Move, []float64, float64) {
@@ -204,23 +350,70 @@ func (a *Agent) predict(features []float64) float64 {
 	return output
 }
 
+// initAdam allocates Adam moment estimates on first use.
+func (a *Agent) initAdam() {
+	if len(a.adamM1W1) > 0 {
+		return
+	}
+	n := len(a.W1)
+	h := len(a.W2)
+	a.adamM1W1 = make([]float64, n)
+	a.adamM2W1 = make([]float64, n)
+	a.adamM1W2 = make([]float64, h)
+	a.adamM2W2 = make([]float64, h)
+	a.adamM1B1 = make([]float64, h)
+	a.adamM2B1 = make([]float64, h)
+}
+
+// trainTowards updates weights using the Adam optimizer toward the given target.
+// alpha is the Adam step size (learning rate).
 func (a *Agent) trainTowards(features []float64, target, alpha float64) {
+	a.initAdam()
+	a.adamT++
+	t := float64(a.adamT)
+	bc1 := 1.0 - math.Pow(adamBeta1, t)
+	bc2 := 1.0 - math.Pow(adamBeta2, t)
+
 	hidden, _, output := a.forward(features)
 	deltaOut := clamp(target-output, -2, 2)
+
+	// Save W2 before updating — needed for hidden-layer backprop.
 	oldW2 := append([]float64(nil), a.W2...)
 
+	// Adam update for W2.
 	for j := 0; j < a.HiddenSize; j++ {
-		a.W2[j] += alpha * deltaOut * hidden[j]
+		g := -deltaOut * hidden[j]
+		a.adamM1W2[j] = adamBeta1*a.adamM1W2[j] + (1-adamBeta1)*g
+		a.adamM2W2[j] = adamBeta2*a.adamM2W2[j] + (1-adamBeta2)*g*g
+		a.W2[j] -= alpha * (a.adamM1W2[j] / bc1) / (math.Sqrt(a.adamM2W2[j]/bc2) + adamEps)
 	}
-	a.B2 += alpha * deltaOut
 
+	// Adam update for B2.
+	{
+		g := -deltaOut
+		a.adamM1B2 = adamBeta1*a.adamM1B2 + (1-adamBeta1)*g
+		a.adamM2B2 = adamBeta2*a.adamM2B2 + (1-adamBeta2)*g*g
+		a.B2 -= alpha * (a.adamM1B2 / bc1) / (math.Sqrt(a.adamM2B2/bc2) + adamEps)
+	}
+
+	// Adam update for W1 and B1 using pre-update W2 for backprop.
 	for j := 0; j < a.HiddenSize; j++ {
-		deltaHidden := (1 - hidden[j]*hidden[j]) * oldW2[j] * deltaOut
+		deltaHidden := (1.0 - hidden[j]*hidden[j]) * oldW2[j] * deltaOut
+
+		// B1
+		gB := -deltaHidden
+		a.adamM1B1[j] = adamBeta1*a.adamM1B1[j] + (1-adamBeta1)*gB
+		a.adamM2B1[j] = adamBeta2*a.adamM2B1[j] + (1-adamBeta2)*gB*gB
+		a.B1[j] -= alpha * (a.adamM1B1[j] / bc1) / (math.Sqrt(a.adamM2B1[j]/bc2) + adamEps)
+
+		// W1
 		offset := j * a.InputSize
 		for i := 0; i < a.InputSize; i++ {
-			a.W1[offset+i] += alpha * deltaHidden * features[i]
+			g := -deltaHidden * features[i]
+			a.adamM1W1[offset+i] = adamBeta1*a.adamM1W1[offset+i] + (1-adamBeta1)*g
+			a.adamM2W1[offset+i] = adamBeta2*a.adamM2W1[offset+i] + (1-adamBeta2)*g*g
+			a.W1[offset+i] -= alpha * (a.adamM1W1[offset+i] / bc1) / (math.Sqrt(a.adamM2W1[offset+i]/bc2) + adamEps)
 		}
-		a.B1[j] += alpha * deltaHidden
 	}
 }
 
