@@ -74,7 +74,7 @@ func TrainOnHardPositions(agent *Agent, cfg HardeningConfig) HardeningStats {
 			} else if current == alphaPlayer {
 				move = board.BestMove(current, cfg.TeacherDepth)
 			} else {
-				move = agent.BestMove(board, current)
+				move = agent.BestMoveWithSearch(board, current, rlSearchDepth)
 			}
 
 			if move.Row == -1 || move.Col == -1 {

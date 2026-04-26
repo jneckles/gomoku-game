@@ -24,32 +24,43 @@ type replayBuffer struct {
 }
 
 type TrainerConfig struct {
-	BoardSize       int
-	Episodes        int
-	LearningRate    float64
-	Discount        float64
-	EpsilonStart    float64
-	EpsilonEnd      float64
-	OpponentDepth   int
-	TeacherDepth    int
-	TeacherBlend    float64
-	MixedCurriculum bool
-	Seed            int64
+	BoardSize           int
+	Episodes            int
+	ScheduleEpisodes    int
+	EpisodeOffset       int
+	LearningRate        float64
+	Discount            float64
+	EpsilonStart        float64
+	EpsilonEnd          float64
+	OpponentDepth       int
+	TeacherDepth        int
+	TeacherBlend        float64
+	WarmupEpisodes      int
+	WarmupOpponentDepth int
+	WarmupTeacherBlend  float64
+	WarmupLRScale       float64
+	MixedCurriculum     bool
+	Seed                int64
 }
 
 func DefaultTrainerConfig() TrainerConfig {
 	return TrainerConfig{
-		BoardSize:       15,
-		Episodes:        2000,
-		LearningRate:    0.001,
-		Discount:        0.95,
-		EpsilonStart:    0.24,
-		EpsilonEnd:      0.02,
-		OpponentDepth:   3,
-		TeacherDepth:    3,
-		TeacherBlend:    0.18,
-		MixedCurriculum: true,
-		Seed:            time.Now().UnixNano(),
+		BoardSize:           15,
+		Episodes:            2000,
+		ScheduleEpisodes:    2000,
+		LearningRate:        0.0004,
+		Discount:            0.95,
+		EpsilonStart:        0.24,
+		EpsilonEnd:          0.02,
+		OpponentDepth:       3,
+		TeacherDepth:        3,
+		TeacherBlend:        0.12,
+		WarmupEpisodes:      600,
+		WarmupOpponentDepth: 1,
+		WarmupTeacherBlend:  0.04,
+		WarmupLRScale:       0.35,
+		MixedCurriculum:     true,
+		Seed:                time.Now().UnixNano(),
 	}
 }
 
@@ -62,8 +73,9 @@ func Train(agent *Agent, cfg TrainerConfig) Stats {
 	replay := &replayBuffer{data: make([]experience, 0, replayCapacity)}
 
 	for episode := 0; episode < cfg.Episodes; episode++ {
-		epsilon := epsilonForEpisode(cfg, episode)
-		result := playTrainingEpisode(agent, cfg, epsilon, rng, replay)
+		globalEpisode := cfg.EpisodeOffset + episode
+		epsilon := epsilonForEpisode(cfg, globalEpisode)
+		result := playTrainingEpisode(agent, cfg, globalEpisode, epsilon, rng, replay)
 
 		switch result {
 		case 1:
@@ -85,11 +97,14 @@ type rlTrajectoryStep struct {
 	shapingRwd float64
 }
 
-func playTrainingEpisode(agent *Agent, cfg TrainerConfig, epsilon float64, rng *rand.Rand, replay *replayBuffer) int {
+func playTrainingEpisode(agent *Agent, cfg TrainerConfig, globalEpisode int, epsilon float64, rng *rand.Rand, replay *replayBuffer) int {
 	board := game.FullBoard(cfg.BoardSize)
 	rlPlayer := game.P1
 	opponent := game.P2
 	current := game.P1
+	teacherBlend := scheduledTeacherBlend(cfg, globalEpisode)
+	learningRate := scheduledLearningRate(cfg, globalEpisode)
+	effectiveOpponentDepth := scheduledOpponentDepth(cfg, globalEpisode)
 
 	if rng.Intn(2) == 1 {
 		rlPlayer = game.P2
@@ -104,7 +119,7 @@ func playTrainingEpisode(agent *Agent, cfg TrainerConfig, epsilon float64, rng *
 
 			move, features, _ := agent.selectMove(board, rlPlayer, epsilon, rng)
 			if move.Row == -1 {
-				applyMCReturns(agent, replay, trajectory, 0.0, cfg.LearningRate, cfg.Discount, rng)
+				applyMCReturns(agent, replay, trajectory, 0.0, learningRate, cfg.Discount, rng)
 				return 0
 			}
 
@@ -113,19 +128,19 @@ func playTrainingEpisode(agent *Agent, cfg TrainerConfig, epsilon float64, rng *
 			if teacherDepth <= 0 {
 				teacherDepth = max(1, cfg.OpponentDepth)
 			}
-			if shouldConsultTeacher(board, rlPlayer) {
+			if teacherBlend > 0 && shouldConsultTeacher(board, rlPlayer) {
 				teacherMove := board.BestMove(rlPlayer, teacherDepth)
 				if teacherMove.Row != -1 && (teacherMove.Row != move.Row || teacherMove.Col != move.Col) {
-					blend := clamp(cfg.TeacherBlend, 0, 1)
+					blend := clamp(teacherBlend, 0, 1)
 					teacherFeatures := extractFeatures(board, rlPlayer, teacherMove)
 					penaltyTarget := imitationNegativeTarget(board, rlPlayer, move)
-					applyLearning(agent, replay, teacherFeatures, 0.85, cfg.LearningRate*blend, rng)
-					applyLearning(agent, replay, features, penaltyTarget, cfg.LearningRate*blend, rng)
+					applyLearning(agent, replay, teacherFeatures, 0.85, learningRate*blend, rng)
+					applyLearning(agent, replay, features, penaltyTarget, learningRate*blend, rng)
 				}
 			}
 
 			if err := board.Place(move.Row, move.Col, rlPlayer); err != nil {
-				applyMCReturns(agent, replay, trajectory, -1.0, cfg.LearningRate, cfg.Discount, rng)
+				applyMCReturns(agent, replay, trajectory, -1.0, learningRate, cfg.Discount, rng)
 				return -1
 			}
 
@@ -145,29 +160,29 @@ func playTrainingEpisode(agent *Agent, cfg TrainerConfig, epsilon float64, rng *
 			trajectory = append(trajectory, rlTrajectoryStep{features: features, shapingRwd: shaping})
 
 			if board.HasFive(move.Row, move.Col, rlPlayer) {
-				applyMCReturns(agent, replay, trajectory, 1.0, cfg.LearningRate, cfg.Discount, rng)
+				applyMCReturns(agent, replay, trajectory, 1.0, learningRate, cfg.Discount, rng)
 				return 1
 			}
 			if board.Full() {
-				applyMCReturns(agent, replay, trajectory, 0.0, cfg.LearningRate, cfg.Discount, rng)
+				applyMCReturns(agent, replay, trajectory, 0.0, learningRate, cfg.Discount, rng)
 				return 0
 			}
 
-			opponentMove := chooseOpponentMove(board, opponent, opponentDepthForEpisode(cfg, rng), rng, episodeOpponentStyle(rng))
+			opponentMove := chooseOpponentMove(board, opponent, effectiveOpponentDepth, rng, episodeOpponentStyle(cfg, globalEpisode, rng))
 			if opponentMove.Row == -1 {
-				applyMCReturns(agent, replay, trajectory, 0.0, cfg.LearningRate, cfg.Discount, rng)
+				applyMCReturns(agent, replay, trajectory, 0.0, learningRate, cfg.Discount, rng)
 				return 0
 			}
 			if err := board.Place(opponentMove.Row, opponentMove.Col, opponent); err != nil {
-				applyMCReturns(agent, replay, trajectory, -1.0, cfg.LearningRate, cfg.Discount, rng)
+				applyMCReturns(agent, replay, trajectory, -1.0, learningRate, cfg.Discount, rng)
 				return -1
 			}
 			if board.HasFive(opponentMove.Row, opponentMove.Col, opponent) {
-				applyMCReturns(agent, replay, trajectory, -1.0, cfg.LearningRate, cfg.Discount, rng)
+				applyMCReturns(agent, replay, trajectory, -1.0, learningRate, cfg.Discount, rng)
 				return -1
 			}
 			if board.Full() {
-				applyMCReturns(agent, replay, trajectory, 0.0, cfg.LearningRate, cfg.Discount, rng)
+				applyMCReturns(agent, replay, trajectory, 0.0, learningRate, cfg.Discount, rng)
 				return 0
 			}
 
@@ -176,7 +191,7 @@ func playTrainingEpisode(agent *Agent, cfg TrainerConfig, epsilon float64, rng *
 		}
 
 		// Opponent's initial move (only reached when rlPlayer == P2).
-		move := chooseOpponentMove(board, current, opponentDepthForEpisode(cfg, rng), rng, episodeOpponentStyle(rng))
+		move := chooseOpponentMove(board, current, effectiveOpponentDepth, rng, episodeOpponentStyle(cfg, globalEpisode, rng))
 		if move.Row == -1 {
 			return 0
 		}
@@ -185,7 +200,7 @@ func playTrainingEpisode(agent *Agent, cfg TrainerConfig, epsilon float64, rng *
 		}
 		if board.HasFive(move.Row, move.Col, current) {
 			if current == opponent {
-				applyMCReturns(agent, replay, trajectory, -1.0, cfg.LearningRate, cfg.Discount, rng)
+				applyMCReturns(agent, replay, trajectory, -1.0, learningRate, cfg.Discount, rng)
 				return -1
 			}
 			return 1
@@ -193,7 +208,7 @@ func playTrainingEpisode(agent *Agent, cfg TrainerConfig, epsilon float64, rng *
 		current = rlPlayer
 	}
 
-	applyMCReturns(agent, replay, trajectory, 0.0, cfg.LearningRate, cfg.Discount, rng)
+	applyMCReturns(agent, replay, trajectory, 0.0, learningRate, cfg.Discount, rng)
 	return 0
 }
 
@@ -224,7 +239,7 @@ func Evaluate(agent *Agent, cfg TrainerConfig, episodes int) Stats {
 	stats := Stats{Episodes: episodes}
 
 	for episode := 0; episode < episodes; episode++ {
-		result := playTrainingEpisode(agent, evalCfg, 0, rng, nil)
+		result := playTrainingEpisode(agent, evalCfg, episode, 0, rng, nil)
 		switch result {
 		case 1:
 			stats.Wins++
@@ -239,10 +254,17 @@ func Evaluate(agent *Agent, cfg TrainerConfig, episodes int) Stats {
 }
 
 func epsilonForEpisode(cfg TrainerConfig, episode int) float64 {
-	if cfg.Episodes <= 1 {
+	totalEpisodes := cfg.ScheduleEpisodes
+	if totalEpisodes <= 0 {
+		totalEpisodes = cfg.Episodes
+	}
+	if totalEpisodes <= 1 {
 		return cfg.EpsilonEnd
 	}
-	progress := float64(episode) / float64(cfg.Episodes-1)
+	if episode >= totalEpisodes {
+		episode = totalEpisodes - 1
+	}
+	progress := float64(episode) / float64(totalEpisodes-1)
 	return cfg.EpsilonStart + progress*(cfg.EpsilonEnd-cfg.EpsilonStart)
 }
 
@@ -297,7 +319,19 @@ func chooseOpponentMove(board *game.Board, player game.Player, depth int, rng *r
 	}
 }
 
-func episodeOpponentStyle(rng *rand.Rand) string {
+func episodeOpponentStyle(cfg TrainerConfig, globalEpisode int, rng *rand.Rand) string {
+	if globalEpisode < cfg.WarmupEpisodes {
+		roll := rng.Float64()
+		switch {
+		case roll < 0.20:
+			return "random"
+		case roll < 0.30:
+			return "mirror"
+		default:
+			return "search"
+		}
+	}
+
 	roll := rng.Float64()
 	switch {
 	case roll < 0.10:
@@ -307,6 +341,40 @@ func episodeOpponentStyle(rng *rand.Rand) string {
 	default:
 		return "search"
 	}
+}
+
+func scheduledTeacherBlend(cfg TrainerConfig, globalEpisode int) float64 {
+	if cfg.WarmupEpisodes <= 0 || globalEpisode >= cfg.WarmupEpisodes {
+		return cfg.TeacherBlend
+	}
+	progress := float64(globalEpisode) / float64(max(1, cfg.WarmupEpisodes))
+	return cfg.WarmupTeacherBlend + (cfg.TeacherBlend-cfg.WarmupTeacherBlend)*progress
+}
+
+func scheduledLearningRate(cfg TrainerConfig, globalEpisode int) float64 {
+	if cfg.WarmupEpisodes <= 0 || globalEpisode >= cfg.WarmupEpisodes {
+		return cfg.LearningRate
+	}
+	scale := cfg.WarmupLRScale
+	if scale <= 0 {
+		scale = 0.35
+	}
+	progress := float64(globalEpisode) / float64(max(1, cfg.WarmupEpisodes))
+	factor := scale + (1.0-scale)*progress
+	return cfg.LearningRate * factor
+}
+
+func scheduledOpponentDepth(cfg TrainerConfig, globalEpisode int) int {
+	if cfg.WarmupEpisodes <= 0 || globalEpisode >= cfg.WarmupEpisodes {
+		return cfg.OpponentDepth
+	}
+	if cfg.WarmupOpponentDepth <= 0 {
+		return max(1, cfg.OpponentDepth-1)
+	}
+	if globalEpisode < cfg.WarmupEpisodes/2 {
+		return cfg.WarmupOpponentDepth
+	}
+	return max(cfg.WarmupOpponentDepth, cfg.OpponentDepth-1)
 }
 
 func shouldConsultTeacher(board *game.Board, player game.Player) bool {

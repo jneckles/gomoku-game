@@ -23,7 +23,7 @@ import (
 const (
 	boardSize        = 15
 	searchDepth      = 3
-	rlSearchDepth    = 2 // depth for RL alpha-beta at inference (2 = see opponent reply)
+	rlSearchDepth    = 4 // searched RL now looks at least as deep as the alpha-beta baseline
 	defaultModelPath = "models/rl_player.json"
 	aiAlphaBeta      = "Alpha-Beta"
 	aiRL             = "Reinforcement Learning"
@@ -133,6 +133,7 @@ func runTraining(modelPath string, episodes int, opponentDepth int, checkpointEv
 	cfg := rl.DefaultTrainerConfig()
 	cfg.BoardSize = boardSize
 	cfg.Episodes = episodes
+	cfg.ScheduleEpisodes = episodes
 	cfg.OpponentDepth = opponentDepth
 	cfg.TeacherDepth = max(2, opponentDepth)
 	if checkpointEvery <= 0 {
@@ -171,6 +172,8 @@ func runTraining(modelPath string, episodes int, opponentDepth int, checkpointEv
 		chunkEpisodes := min(checkpointEvery, episodes-completed)
 		chunkCfg := cfg
 		chunkCfg.Episodes = chunkEpisodes
+		chunkCfg.EpisodeOffset = completed
+		chunkCfg.ScheduleEpisodes = episodes
 		chunkStats := rl.Train(agent, chunkCfg)
 		completed += chunkEpisodes
 
@@ -317,6 +320,7 @@ func runOptimize(modelPath string, cycles int, episodes int, opponentDepth int, 
 	trainCfg := rl.DefaultTrainerConfig()
 	trainCfg.BoardSize = boardSize
 	trainCfg.Episodes = episodes
+	trainCfg.ScheduleEpisodes = episodes
 	trainCfg.OpponentDepth = opponentDepth
 	trainCfg.TeacherDepth = max(2, opponentDepth)
 	trainCfg.MixedCurriculum = true
@@ -355,6 +359,8 @@ func runOptimize(modelPath string, cycles int, episodes int, opponentDepth int, 
 				chunkEpisodes := min(checkpointEvery, episodes-completed)
 				chunkCfg := trainCfg
 				chunkCfg.Episodes = chunkEpisodes
+				chunkCfg.EpisodeOffset = completed
+				chunkCfg.ScheduleEpisodes = episodes
 				chunkStats := rl.Train(workingAgent, chunkCfg)
 				completed += chunkEpisodes
 				fmt.Printf("cycle %d train %d/%d: %s\n", cycle, completed, episodes, rl.Summary(chunkStats))

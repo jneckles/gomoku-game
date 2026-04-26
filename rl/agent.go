@@ -26,7 +26,7 @@ const (
 	adamEps   = 1e-8
 
 	// RL inference: alpha-beta depth using RL as the leaf evaluator
-	rlSearchDepth = 2
+	rlSearchDepth = 4
 )
 
 type Agent struct {
@@ -59,6 +59,11 @@ type Stats struct {
 	Losses       int
 	Draws        int
 	FinalEpsilon float64
+}
+
+type ttEntry struct {
+	depth int
+	value float64
 }
 
 func (s Stats) TotalGames() int {
@@ -182,6 +187,7 @@ func (a *Agent) BestMoveWithSearch(board *game.Board, player game.Player, depth 
 		return game.Move{Row: -1, Col: -1}
 	}
 
+	cache := make(map[string]ttEntry, 4096)
 	bestMove := moves[0]
 	bestScore := math.Inf(-1)
 	alpha := math.Inf(-1)
@@ -198,7 +204,7 @@ func (a *Agent) BestMoveWithSearch(board *game.Board, player game.Player, depth 
 		} else if depth <= 1 {
 			score = a.leafValue(board, player)
 		} else {
-			score = a.rlAlphaBeta(board, depth-1, alpha, beta, false, player, move)
+			score = a.rlAlphaBeta(board, depth-1, alpha, beta, false, player, move, cache)
 		}
 
 		board.Remove(move.Row, move.Col)
@@ -216,8 +222,16 @@ func (a *Agent) BestMoveWithSearch(board *game.Board, player game.Player, depth 
 }
 
 // rlAlphaBeta is minimax with alpha-beta pruning, using the RL network at leaves.
-func (a *Agent) rlAlphaBeta(board *game.Board, depth int, alpha, beta float64, maximizing bool, aiPlayer game.Player, lastMove game.Move) float64 {
+func (a *Agent) rlAlphaBeta(board *game.Board, depth int, alpha, beta float64, maximizing bool, aiPlayer game.Player, lastMove game.Move, cache map[string]ttEntry) float64 {
 	opponent := aiPlayer.Other()
+	cacheKey := ""
+
+	if cache != nil {
+		cacheKey = boardCacheKey(board, depth, maximizing, aiPlayer)
+		if entry, ok := cache[cacheKey]; ok && entry.depth >= depth {
+			return entry.value
+		}
+	}
 
 	lastPlayer := opponent
 	if !maximizing {
@@ -227,19 +241,33 @@ func (a *Agent) rlAlphaBeta(board *game.Board, depth int, alpha, beta float64, m
 	if lastMove.Row != -1 && lastMove.Col != -1 {
 		if board.HasFive(lastMove.Row, lastMove.Col, lastPlayer) {
 			if lastPlayer == aiPlayer {
+				if cache != nil {
+					cache[cacheKey] = ttEntry{depth: depth, value: 1.0}
+				}
 				return 1.0
+			}
+			if cache != nil {
+				cache[cacheKey] = ttEntry{depth: depth, value: -1.0}
 			}
 			return -1.0
 		}
 	}
 
 	if depth == 0 || board.Full() {
-		return a.leafValue(board, aiPlayer)
+		value := a.leafValue(board, aiPlayer)
+		if cache != nil {
+			cache[cacheKey] = ttEntry{depth: depth, value: value}
+		}
+		return value
 	}
 
 	moves := board.GenerateMoves()
 	if len(moves) == 0 {
-		return a.leafValue(board, aiPlayer)
+		value := a.leafValue(board, aiPlayer)
+		if cache != nil {
+			cache[cacheKey] = ttEntry{depth: depth, value: value}
+		}
+		return value
 	}
 
 	if maximizing {
@@ -248,7 +276,7 @@ func (a *Agent) rlAlphaBeta(board *game.Board, depth int, alpha, beta float64, m
 			if err := board.Place(move.Row, move.Col, aiPlayer); err != nil {
 				continue
 			}
-			score := a.rlAlphaBeta(board, depth-1, alpha, beta, false, aiPlayer, move)
+			score := a.rlAlphaBeta(board, depth-1, alpha, beta, false, aiPlayer, move, cache)
 			board.Remove(move.Row, move.Col)
 			if score > value {
 				value = score
@@ -260,6 +288,9 @@ func (a *Agent) rlAlphaBeta(board *game.Board, depth int, alpha, beta float64, m
 				break
 			}
 		}
+		if cache != nil {
+			cache[cacheKey] = ttEntry{depth: depth, value: value}
+		}
 		return value
 	}
 
@@ -268,7 +299,7 @@ func (a *Agent) rlAlphaBeta(board *game.Board, depth int, alpha, beta float64, m
 		if err := board.Place(move.Row, move.Col, opponent); err != nil {
 			continue
 		}
-		score := a.rlAlphaBeta(board, depth-1, alpha, beta, true, aiPlayer, move)
+		score := a.rlAlphaBeta(board, depth-1, alpha, beta, true, aiPlayer, move, cache)
 		board.Remove(move.Row, move.Col)
 		if score < value {
 			value = score
@@ -279,6 +310,9 @@ func (a *Agent) rlAlphaBeta(board *game.Board, depth int, alpha, beta float64, m
 		if beta <= alpha {
 			break
 		}
+	}
+	if cache != nil {
+		cache[cacheKey] = ttEntry{depth: depth, value: value}
 	}
 	return value
 }
@@ -662,4 +696,20 @@ func centerControl(board *game.Board, player game.Player) float64 {
 
 func errorsf(msg string) error {
 	return fmt.Errorf(msg)
+}
+
+func boardCacheKey(board *game.Board, depth int, maximizing bool, aiPlayer game.Player) string {
+	buf := make([]byte, 0, board.Size*board.Size+4)
+	buf = append(buf, byte(depth), byte(aiPlayer))
+	if maximizing {
+		buf = append(buf, 1)
+	} else {
+		buf = append(buf, 0)
+	}
+	for r := 0; r < board.Size; r++ {
+		for c := 0; c < board.Size; c++ {
+			buf = append(buf, byte(board.Cells[r][c]))
+		}
+	}
+	return string(buf)
 }

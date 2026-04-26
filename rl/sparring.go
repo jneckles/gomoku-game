@@ -74,14 +74,14 @@ func TrainBySparring(agent *Agent, cfg SparringConfig) SparringStats {
 					break
 				}
 
-				rlMove := agent.BestMove(board, current)
+				rlMove := agent.BestMoveWithSearch(board, current, rlSearchDepth)
 				if rlMove.Row != -1 && (rlMove.Row != teacherMove.Row || rlMove.Col != teacherMove.Col) {
 					target := imitationNegativeTarget(board, current, rlMove)
 					agent.trainTowards(extractFeatures(board, current, rlMove), target, cfg.LearningRate*0.9)
 				}
 				trainOnTeacherMove(agent, board, current, teacherMove, cfg.NegativeSamples, cfg.LearningRate, rng)
 				stats.PositionsTrained++
-				move = agent.BestMove(board, current)
+				move = agent.BestMoveWithSearch(board, current, rlSearchDepth)
 			}
 
 			if move.Row == -1 || move.Col == -1 {
