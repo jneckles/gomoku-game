@@ -132,7 +132,7 @@ func evalLine(line []Player, player Player) int {
 	return score
 }
 
-// scoreRun returns a score for a run of pieces/moves with some number of open ends
+// scoreRun returns a score for a run of pieces with some number of open ends.
 func scoreRun(runLen int, openEnds int) int {
 	if openEnds == 0 && runLen < 5 {
 		return 0
@@ -143,24 +143,24 @@ func scoreRun(runLen int, openEnds int) int {
 		return 1_000_000
 	case 4:
 		if openEnds == 2 {
-			return 100_000 // this is an open 4 run so both sides are free
+			return 100_000
 		}
 		if openEnds == 1 {
-			return 10_000 // this is a closed 4 or one side is blocked
+			return 10_000
 		}
 	case 3:
 		if openEnds == 2 {
-			return 5_000 // this is an open 3 run so both sides are free
+			return 5_000
 		}
 		if openEnds == 1 {
-			return 500 // closed 3 so only one side open
+			return 500
 		}
 	case 2:
 		if openEnds == 2 {
-			return 200 // open 2 run so both sides are free
+			return 200
 		}
 		if openEnds == 1 {
-			return 50 // closed 2 so only one side is free
+			return 50
 		}
 	case 1:
 		if openEnds == 2 {
@@ -171,7 +171,6 @@ func scoreRun(runLen int, openEnds int) int {
 		}
 	}
 
-	// this rewards any runs that happen to be longer than 5
 	if runLen > 5 {
 		return 1_000_000
 	}
